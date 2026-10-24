@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<!--
+  ============================================================================
+  项目名称：指尖花开 · 手势控制花朵在指尖绽放（Gesture Flower）
+  ----------------------------------------------------------------------------
+  技术栈：
+    · Three.js            —— 3D 粒子渲染（ShaderMaterial + 加法混合 + 自定义 GLSL）
+    · MediaPipe Hands     —— 手部 21 个关键点实时识别
+    · 原生 HTML / CSS / JS —— 不使用任何前端框架
+
+  依赖说明（无需 npm install，也无需联网）：
+    · vendor/three/build/three.module.js      —— Three.js r160
+    · vendor/mediapipe/hands/                 —— MediaPipe Hands + wasm + 模型
+    两者都已放在本地 vendor 目录，因此断网也能正常运行。
+
+  运行方式（必须通过本地 HTTP 服务打开，不能直接双击 file:// 打开）：
+    cd F:\DSH_Workspace\Gesture_Flower
+    python -m http.server 5500
+    浏览器访问： http://localhost:5500
+  ----------------------------------------------------------------------------
+  浏览器要求：Chrome / Edge 等支持 WebGL2 + getUserMedia 的现代浏览器。
+  摄像头 API 只在“安全上下文”下可用：http://localhost 或 https:// 均可，
+  直接以 file:// 打开会被浏览器禁用摄像头。
+  ============================================================================
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <meta name="theme-color" content="#05010c" />
+  <meta name="description" content="手势控制粒子花朵在指尖绽放 —— Three.js + MediaPipe Hands + GLSL" />
+  <title>指尖花开 · 手势控制花朵绽放</title>
+
+  <!-- 基础样式 -->
+  <link rel="stylesheet" href="./style.css" />
+
+  <!--
+    Three.js 通过 importmap 以 ES Module 方式引入。
+    这样 main.js 里就可以直接 `import * as THREE from 'three'`，
+    而无需打包工具（Vite/Webpack）。
+
+    ★ 这里指向本地 vendor/ 目录，而不是 CDN ★
+    原因：部分网络环境（尤其是国内）无法访问 cdn.jsdelivr.net，连接会被直接重置
+    （控制台报 net::ERR_CONNECTION_RESET）。由于 main.js 用的是静态 import，
+    一旦 CDN 拉取失败，整个模块都不会执行，页面会永远停在启动页且没有任何报错。
+    把依赖放在本地就彻底摆脱了这个问题，离线也能跑。
+    版本：three r160（vendor/three/build/three.module.js）
+  -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "./vendor/three/build/three.module.js",
+      "three/addons/": "./vendor/three/examples/jsm/"
+    }
+  }
+  </script>
+
+  <!--
+    MediaPipe Hands（UMD 版本，加载后会在 window 上挂载全局构造器 `Hands`）。
+    注意：这是传统 <script> 标签（非 module），因此会在 main.js（type="module"）
+    之前同步执行完毕，main.js 中可以安全访问 window.Hands。
+    wasm / 模型资源由 main.js 中的 locateFile 回调指向本地 vendor 目录。
+  -->
+  <script src="./vendor/mediapipe/hands/hands.js"></script>
+</head>
+
+<body>
+  <!-- ======================================================================
+       图层结构（从下到上）：
+         z-index 0 : #cam            —— 摄像头视频（全屏背景，C 键切换 0.2 / 0）
+         z-index 1 : #vignette       —— 暗角 / 渐晕装饰层
+         z-index 1 : #stardustCanvas —— 星尘粒子背景
+         z-index 2 : #skeletonCanvas —— 手部 21 关键点骨架叠加层（2D Canvas）
+         z-index 3 : #sceneCanvas    —— Three.js 粒子花朵渲染画布（透明背景）
+         z-index 20+: HUD 面板 / 工具栏 / 提示
+
+       注意：摄像头只作为【全屏背景层】使用，不存在任何画中画窗口。
+       ====================================================================== -->
+
+  <!-- ① 摄像头视频：全屏背景层（默认 opacity 0.2，按 C 键切换为纯星空） -->
+  <video id="cam" playsinline autoplay muted></video>
+
+  <!-- ② 渐晕装饰层：让画面中心更聚焦 -->
+  <div id="vignette" aria-hidden="true"></div>
+
+  <!-- ②.5【重构四】星尘背景：若隐若现的粒子星点，不抢主视觉 -->
+  <canvas id="stardustCanvas" aria-hidden="true"></canvas>
+
+  <!-- ③ 手部骨架叠加层（2D Canvas，尺寸随窗口变化） -->
+  <canvas id="skeletonCanvas"></canvas>
+
+  <!-- ④ Three.js 粒子花朵画布 -->
+  <canvas id="sceneCanvas"></canvas>
+
+  <!-- ============ 右上角：摄像头画中画预览窗（P 键切换显示） ============
+       只有这一处显示摄像头画面，作为操作反馈；全屏背景由 #cam 自己控制。 -->
+  <div id="camPreview" aria-hidden="true">
+    <div class="cam-preview-glow"></div>
+    <div class="cam-preview-frame">
+      <canvas id="camPreviewCanvas" width="320" height="240"></canvas>
+      <span class="cam-live"><i></i>LIVE</span>
+    </div>
+    <div class="cam-preview-label">CAM · 21pt</div>
+  </div>
+
+  <!-- ====================== HUD：左上角标题与状态 ====================== -->
+  <header id="hud" class="panel">
+    <div class="hud-title">
+      <span class="logo-dot"></span>
+      <span>指尖花开</span>
+      <small>Gesture Flower · Three.js + MediaPipe</small>
+    </div>
+
+    <div class="hud-rows">
+      <div class="hud-row">
+        <span class="k">摄像头</span>
+        <span class="v" id="hudCamera">未启动</span>
+      </div>
+      <div class="hud-row">
+        <span class="k">手部识别</span>
+        <span class="v" id="hudHand">等待中</span>
+      </div>
+      <div class="hud-row">
+        <span class="k">渲染帧率</span>
+        <span class="v" id="hudFps">-- FPS</span>
+      </div>
+      <div class="hud-row">
+        <span class="k">工作模式</span>
+        <span class="v" id="hudMode">摄像头手势</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ============ 【极简 UI】底部中央：唯一的状态提示行 ============ -->
+  <div id="statusBar">
+    <span class="status-dot" id="statusDot"></span>
+    <span id="statusText">状态：初始化中…</span>
+  </div>
+  <!-- ====================== 底部工具栏 ====================== -->
+  <div id="toolbar">
+    <button id="btnSkeleton" class="tbtn" type="button" aria-pressed="true">骨架 <kbd>K</kbd></button>
+    <button id="btnCamera" class="tbtn" type="button" aria-pressed="true">摄像头背景 <kbd>C</kbd></button>
+    <button id="btnPreview" class="tbtn" type="button" aria-pressed="true">预览 <kbd>P</kbd></button>
+    <button id="btnDemo" class="tbtn" type="button" aria-pressed="false">演示模式 <kbd>空格</kbd></button>
+    <button id="btnReset" class="tbtn" type="button">重置跟随 <kbd>R</kbd></button>
+    <button id="btnFullscreen" class="tbtn" type="button">全屏 <kbd>F</kbd></button>
+  </div>
+
+  <!-- ====================== 底部操作提示条 ====================== -->
+  <div id="hintBar">
+    <span id="hintText">握拳 → 花苞聚合　|　张开五指 → 花朵绽放　|　移动手掌 → 花朵跟随指尖</span>
+  </div>
+
+  <!-- ====================== 启动遮罩（需要用户手势才能请求摄像头） ====================== -->
+  <div id="bootOverlay" class="overlay">
+    <div class="boot-card">
+      <div class="boot-flower" aria-hidden="true">
+        <span></span><span></span><span></span><span></span><span></span><span></span>
+      </div>
+      <h1>指尖花开</h1>
+      <p class="boot-sub">用手掌的开合，控制 14000 颗粒子在指尖绽放成一朵花。</p>
+
+      <div class="boot-actions">
+        <button id="bootStartBtn" class="btn primary" type="button">开启摄像头并开始</button>
+        <button id="bootDemoBtn" class="btn ghost" type="button">无摄像头 · 演示模式</button>
+      </div>
+
+      <div id="bootLoading" class="boot-loading" hidden>
+        <span class="spinner" aria-hidden="true"></span>
+        <span id="bootLoadingText">正在初始化…</span>
+      </div>
+
+      <p class="boot-tip">
+        提示：摄像头 API 需要安全上下文，请务必通过
+        <code>http://localhost:5500</code> 这类本地 HTTP 服务访问，不要直接双击打开 html 文件。
+        <br />
+        依赖（Three.js 与 MediaPipe）已放在本地 <code>vendor/</code> 目录，无需联网即可运行。
+      </p>
+    </div>
+  </div>
+
+  <!-- ====================== 友好错误提示面板 ====================== -->
+  <div id="errorPanel" class="overlay" hidden>
+    <div class="error-card" role="alertdialog" aria-labelledby="errorTitle" aria-describedby="errorDetail">
+      <div class="error-icon" aria-hidden="true">!</div>
+      <h2 id="errorTitle">出了点小问题</h2>
+      <p id="errorDetail">详细说明</p>
+      <ul id="errorList" class="error-list"></ul>
+      <div class="error-actions">
+        <button id="errorRetryBtn" class="btn primary" type="button">重试</button>
+        <button id="errorDemoBtn" class="btn ghost" type="button">改用演示模式</button>
+        <button id="errorCloseBtn" class="btn plain" type="button">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 无脚本兜底提示 -->
+  <noscript>
+    <div class="overlay">
+      <div class="error-card">
+        <h2>需要启用 JavaScript</h2>
+        <p>本项目依赖 WebGL 与摄像头，请在浏览器设置中启用 JavaScript 后刷新页面。</p>
+      </div>
+    </div>
+  </noscript>
+
+  <!-- 核心逻辑：ES Module，使用 importmap 中定义的 "three" -->
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
